@@ -30,4 +30,5 @@ model:
   n_layers: 12
   drop_rate: 0.1
   qkv_bias: false
+  rope: true  # Using Rotary Position Embedding
   mlp: "swiglu"

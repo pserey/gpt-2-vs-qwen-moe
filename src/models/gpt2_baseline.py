@@ -28,6 +28,49 @@ except Exception:
 def count_parameters(module: nn.Module) -> int:
     return sum(p.numel() for p in module.parameters() if p.requires_grad)
 
+# --------------------------------------------------------------------
+# RoPE (Rotary Position Embedding)
+# --------------------------------------------------------------------
+def apply_rope(x):
+    """
+    Apply Rotary Position Embedding to query/key tensors.
+    
+    Args:
+        x: tensor of shape (B, num_heads, T, head_dim)
+    
+    Returns:
+        x_rotated: tensor with RoPE applied
+    """
+    B, H, T, Dh = x.shape
+    device = x.device
+    
+    # RoPE parameters
+    theta = 10000.0
+    
+    # Position indices
+    pos = torch.arange(T, device=device, dtype=torch.float)
+    
+    # Frequency computation
+    inv_freq = torch.pow(theta, -2 * torch.arange(0, Dh, 2, device=device, dtype=torch.float) / Dh)
+    
+    # Create frequency matrix
+    freqs = torch.einsum('t,f->tf', pos, inv_freq)  # (T, Dh//2)
+    
+    # Create cos and sin matrices
+    cos = torch.cos(freqs).unsqueeze(0).unsqueeze(0)  # (1, 1, T, Dh//2)
+    sin = torch.sin(freqs).unsqueeze(0).unsqueeze(0)  # (1, 1, T, Dh//2)
+    
+    # Split x into even and odd dimensions
+    x1 = x[..., 0::2]  # Even dimensions (B, H, T, Dh//2)
+    x2 = x[..., 1::2]  # Odd dimensions (B, H, T, Dh//2)
+    
+    # Apply rotation
+    x_rotated = torch.zeros_like(x)
+    x_rotated[..., 0::2] = x1 * cos - x2 * sin
+    x_rotated[..., 1::2] = x1 * sin + x2 * cos
+    
+    return x_rotated
+
 
 # --------------------------------------------------------------------
 # Core layers
@@ -59,12 +102,13 @@ class SwiGLU(nn.Module):
         return y
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, d_in, d_out, context_length, dropout, num_heads, qkv_bias=False):
+    def __init__(self, d_in, d_out, context_length, dropout, num_heads, qkv_bias=False, rope=False):
         super().__init__()
         assert d_out % num_heads == 0
         self.d_out = d_out
         self.num_heads = num_heads
         self.head_dim = d_out // num_heads
+        self.rope = rope
         self.Wq = nn.Linear(d_in, d_out, bias=qkv_bias)
         self.Wk = nn.Linear(d_in, d_out, bias=qkv_bias)
         self.Wv = nn.Linear(d_in, d_out, bias=qkv_bias)
@@ -74,7 +118,7 @@ class MultiHeadAttention(nn.Module):
 
         logger.debug(
             f"MultiHeadAttention init: d_in={d_in}, d_out={d_out}, heads={num_heads}, "
-            f"head_dim={self.head_dim}, dropout={dropout}"
+            f"head_dim={self.head_dim}, rope={self.rope}, dropout={dropout}"
         )
 
     def forward(self, x):
@@ -84,6 +128,12 @@ class MultiHeadAttention(nn.Module):
         k = self.Wk(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.Wv(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         logger.debug(f"QKV shapes -> q:{tuple(q.shape)}, k:{tuple(k.shape)}, v:{tuple(v.shape)}")
+
+        # Apply RoPE if enabled
+        if self.rope:
+            q = apply_rope(q)
+            k = apply_rope(k)
+            logger.debug("RoPE aplicado a Q e K")
 
         att = q @ k.transpose(2, 3) / (self.head_dim ** 0.5)
         mask_bool = self.mask.bool()[:T, :T]
@@ -125,6 +175,7 @@ class TransformerBlock(nn.Module):
             d_in=cfg['emb_dim'], d_out=cfg['emb_dim'],
             context_length=cfg['context_length'], dropout=cfg['drop_rate'],
             num_heads=cfg['n_heads'], qkv_bias=cfg.get('qkv_bias', False),
+            rope=cfg.get('rope', False),
         )
         self.ff = FeedForward(cfg['emb_dim'], cfg['drop_rate'], mlp=cfg.get('mlp','swiglu'))
         self.norm1 = LayerNorm(cfg['emb_dim'])
@@ -133,7 +184,7 @@ class TransformerBlock(nn.Module):
 
         logger.info(
             f"TransformerBlock init — emb_dim={cfg['emb_dim']} heads={cfg['n_heads']} "
-            f"mlp={cfg.get('mlp','swiglu')} drop={cfg['drop_rate']}"
+            f"rope={cfg.get('rope', False)} mlp={cfg.get('mlp','swiglu')} drop={cfg['drop_rate']}"
         )
 
     def forward(self, x):
@@ -149,7 +200,9 @@ class GPTModel(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.tok_emb = nn.Embedding(cfg['vocab_size'], cfg['emb_dim'])
-        self.pos_emb = nn.Embedding(cfg['context_length'], cfg['emb_dim'])
+        self.use_rope = cfg.get('rope', False)
+        # Only create positional embeddings if not using RoPE
+        self.pos_emb = None if self.use_rope else nn.Embedding(cfg['context_length'], cfg['emb_dim'])
         self.drop = nn.Dropout(cfg['drop_rate'])
         self.blocks = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg['n_layers'])])
         self.ln = LayerNorm(cfg['emb_dim'])
@@ -159,14 +212,25 @@ class GPTModel(nn.Module):
         n_params = count_parameters(self)
         logger.info(
             f"GPTModel init — layers={cfg['n_layers']}, emb_dim={cfg['emb_dim']}, "
-            f"heads={cfg['n_heads']}, mlp={cfg.get('mlp','swiglu')}, params_treináveis={n_params:,}"
+            f"heads={cfg['n_heads']}, rope={self.use_rope}, "
+            f"mlp={cfg.get('mlp','swiglu')}, params_treináveis={n_params:,}"
         )
 
     def forward(self, idx):
         B, T = idx.shape
         logger.info(f"GPTModel.forward — batch={B}, seq_len={T}")
-        pos = torch.arange(T, device=idx.device)
-        x = self.tok_emb(idx) + self.pos_emb(pos)[None, :, :]
+        
+        # Token embeddings
+        x = self.tok_emb(idx)
+        
+        # Add positional embeddings only if not using RoPE
+        if not self.use_rope:
+            pos = torch.arange(T, device=idx.device)
+            x = x + self.pos_emb(pos)[None, :, :]
+            logger.debug("Positional embeddings aplicados")
+        else:
+            logger.debug("Usando RoPE - sem positional embeddings")
+        
         x = self.drop(x)
 
         for bi, blk in enumerate(self.blocks):

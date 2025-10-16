@@ -141,6 +141,7 @@ def main():
         'n_layers': cfg['model']['n_layers'],
         'drop_rate': cfg['model']['drop_rate'],
         'qkv_bias': cfg['model'].get('qkv_bias', False),
+        'rope': cfg['model'].get('rope', False),
         'mlp': cfg['model'].get('mlp', 'swiglu'),
     }
     model = GPTModel(model_cfg).to(device)
