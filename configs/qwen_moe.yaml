@@ -1,0 +1,41 @@
+seed: 42
+model_type: moe
+save_dir: results
+run_name: qwen_moe_6experts_top1
+
+data:
+  train_path: data/train.txt
+  val_path: data/val.txt
+  test_path: data/test.txt
+
+training:
+  num_epochs: 3
+  batch_size: 4
+  context_length: 512
+  learning_rate: 5.0e-4
+  weight_decay: 0.1
+  eval_freq: 50
+  eval_iter: 5
+  grad_clip: 1.0
+  use_mixed_precision: true
+  gradient_checkpointing: false  # Disabled for MoE due to complexity
+  grad_accum_steps: 1
+  scheduler: cosine
+  warmup_steps: 50
+  aux_loss_weight: 0.01  # Weight for MoE auxiliary loss
+
+model:
+  vocab_size: 50257
+  emb_dim: 768
+  n_heads: 12
+  n_layers: 12
+  drop_rate: 0.1
+  qkv_bias: false
+  rope: true
+  mlp: "swiglu"
+  
+  # MoE specific parameters
+  num_experts: 6
+  top_k: 1
+  capacity_factor: 1.1
+  expert_hidden_dim: 640  # Intermediate size for balance

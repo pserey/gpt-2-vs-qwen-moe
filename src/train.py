@@ -1,10 +1,14 @@
-import os, time, math, argparse, yaml, json
+import os, sys, time, math, argparse, yaml, json
 import logging
 import torch
 import torch.nn as nn
 from torch.cuda.amp import autocast, GradScaler
 
+# Add src directory to path for imports
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
 from models.gpt2_baseline import GPTModel
+from models.qwen_moe import GPTModelMoE
 from dataset import create_loaders
 
 # -----------------------------------------------------------------------------
@@ -35,27 +39,34 @@ def cross_entropy_logits(logits, targets):
     return nn.functional.cross_entropy(logits.flatten(0,1), targets.flatten())
 
 @torch.no_grad()
-def calc_loss_loader(data_loader, model, device, eval_iter=5, use_ckpt=False):
+def calc_loss_loader(data_loader, model, device, eval_iter=5, is_moe=False, aux_weight=0.0, use_ckpt=False):
     """Avalia perda média em alguns batches (sem grad)."""
     total = 0.0; n = 0
     for i, (inp, tgt) in enumerate(data_loader):
         if i >= eval_iter: break
         inp, tgt = inp.to(device), tgt.to(device)
-        logits = forward_model(model, inp, use_ckpt=use_ckpt)
-        loss = cross_entropy_logits(logits, tgt)
+        if is_moe:
+            logits, aux_loss = forward_model(model, inp, use_ckpt=use_ckpt)
+            loss = cross_entropy_logits(logits, tgt) + (aux_weight * aux_loss if aux_loss > 0 else 0.0)
+        else:
+            logits = forward_model(model, inp, use_ckpt=use_ckpt)
+            loss = cross_entropy_logits(logits, tgt)
         total += loss.item(); n += 1
     avg = total / max(1, n)
     logger.debug(f"calc_loss_loader -> iters={n}, loss={avg:.4f}")
     return avg
 
-def generate_text(model, tokenizer_enc, prompt, max_new_tokens, context_size, temperature=0.8, top_p=0.9, use_ckpt=False):
+def generate_text(model, tokenizer_enc, prompt, max_new_tokens, context_size, is_moe=False, temperature=0.8, top_p=0.9, use_ckpt=False):
     """Amostra texto (nucleus). Usa o mesmo caminho de forward (com/sem checkpoint)."""
     logger.info(f"Geração qualitativa — prompt='{prompt[:60]}...' tokens={max_new_tokens}")
     model.eval()
     idx = torch.tensor(tokenizer_enc.encode(prompt)).unsqueeze(0).to(next(model.parameters()).device)
     for _ in range(max_new_tokens):
         idx_cond = idx[:, -context_size:]
-        logits = forward_model(model, idx_cond, use_ckpt=use_ckpt)
+        if is_moe:
+            logits, _ = forward_model(model, idx_cond, use_ckpt=use_ckpt)  # Ignore aux_loss during generation
+        else:
+            logits = forward_model(model, idx_cond, use_ckpt=use_ckpt)
         logits = logits[:, -1, :] / max(temperature, 1e-6)
         probs = torch.softmax(logits, dim=-1)
         sorted_probs, sorted_idx = torch.sort(probs, descending=True)
@@ -103,8 +114,17 @@ def _baseline_manual_forward(model: GPTModel, idx, use_ckpt: bool):
     logits = model.head(x)
     return logits
 
+def _moe_manual_forward(model: GPTModelMoE, idx, use_ckpt: bool):
+    # For MoE, we don't use gradient checkpoint due to complexity with aux_loss
+    # The model's forward already handles all the logic
+    logits, aux_loss = model(idx)
+    return logits, aux_loss
+
 def forward_model(model, idx, use_ckpt: bool):
-    return _baseline_manual_forward(model, idx, use_ckpt)
+    if isinstance(model, GPTModelMoE):
+        return _moe_manual_forward(model, idx, use_ckpt)
+    else:
+        return _baseline_manual_forward(model, idx, use_ckpt)
 
 # -----------------------------------------------------------------------------
 def main():
@@ -144,9 +164,26 @@ def main():
         'rope': cfg['model'].get('rope', False),
         'mlp': cfg['model'].get('mlp', 'swiglu'),
     }
-    model = GPTModel(model_cfg).to(device)
+    
+    # Check if this is a MoE model
+    is_moe = cfg.get('model_type') == 'moe' and cfg['model'].get('num_experts', 0) > 0
+    
+    if is_moe:
+        # Add MoE-specific parameters
+        model_cfg.update({
+            'num_experts': cfg['model']['num_experts'],
+            'top_k': cfg['model'].get('top_k', 1),
+            'capacity_factor': cfg['model'].get('capacity_factor', 1.0),
+            'expert_hidden_dim': cfg['model'].get('expert_hidden_dim', 4 * cfg['model']['emb_dim']),
+        })
+        model = GPTModelMoE(model_cfg).to(device)
+        logger.info(f"Modelo: Qwen-MoE — experts={model_cfg['num_experts']}, top_k={model_cfg['top_k']}")
+    else:
+        model = GPTModel(model_cfg).to(device)
+        logger.info(f"Modelo: Baseline GPT-2")
+        
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info(f"Modelo: Baseline GPT-2 — params treináveis={n_params:,}")
+    logger.info(f"Parâmetros treináveis totais: {n_params:,}")
 
     # Optimizer & scheduler
     optim = torch.optim.AdamW(model.parameters(), lr=cfg['training']['learning_rate'], weight_decay=cfg['training']['weight_decay'])
@@ -164,6 +201,7 @@ def main():
     # Logging
     train_losses, val_losses, tokens_seen, throughput_hist = [], [], [], []
     total_tokens = 0; step = 0
+    aux_weight = cfg['training'].get('aux_loss_weight', 0.01) if is_moe else 0.0
 
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats(device)
@@ -177,8 +215,12 @@ def main():
         for i, (inp, tgt) in enumerate(train_loader):
             inp, tgt = inp.to(device), tgt.to(device)
             with autocast(enabled=cfg['training']['use_mixed_precision']):
-                logits = forward_model(model, inp, use_ckpt=use_ckpt)
-                loss = cross_entropy_logits(logits, tgt)
+                if is_moe:
+                    logits, aux_loss = forward_model(model, inp, use_ckpt=use_ckpt)
+                    loss = cross_entropy_logits(logits, tgt) + (aux_weight * aux_loss if aux_loss > 0 else 0.0)
+                else:
+                    logits = forward_model(model, inp, use_ckpt=use_ckpt)
+                    loss = cross_entropy_logits(logits, tgt)
 
             loss = loss / grad_accum
             scaler.scale(loss).backward()
@@ -201,8 +243,8 @@ def main():
                 t0 = time.time()
 
                 if step % cfg['training']['eval_freq'] == 0:
-                    tr = calc_loss_loader(train_loader, model, device, eval_iter=cfg['training']['eval_iter'], use_ckpt=use_ckpt)
-                    va = calc_loss_loader(val_loader, model, device, eval_iter=cfg['training']['eval_iter'], use_ckpt=use_ckpt)
+                    tr = calc_loss_loader(train_loader, model, device, eval_iter=cfg['training']['eval_iter'], is_moe=is_moe, aux_weight=aux_weight, use_ckpt=use_ckpt)
+                    va = calc_loss_loader(val_loader, model, device, eval_iter=cfg['training']['eval_iter'], is_moe=is_moe, aux_weight=aux_weight, use_ckpt=use_ckpt)
                     train_losses.append(tr); val_losses.append(va); tokens_seen.append(total_tokens)
                     logger.info(f"[eval] step={step} train_loss={tr:.3f} val_loss={va:.3f} TPS~{tps:.0f}")
 
@@ -212,7 +254,7 @@ def main():
     model.eval()
     logger.info("===> Avaliando no conjunto de TESTE")
     with torch.no_grad():
-        test_loss = calc_loss_loader(test_loader, model, device, eval_iter=50, use_ckpt=use_ckpt)
+        test_loss = calc_loss_loader(test_loader, model, device, eval_iter=50, is_moe=is_moe, aux_weight=aux_weight, use_ckpt=use_ckpt)
     ppl = math.exp(test_loss) if test_loss < 20 else float('inf')
     logger.info(f"Test PPL: {ppl:.2f} | Peak GPU (GB): {peak_mem:.2f}")
 
@@ -224,7 +266,7 @@ def main():
 
     metrics_path = os.path.join(save_dir, 'metrics', f'{run_name}_metrics.json')
     metrics = {
-        'model_type': 'baseline',
+        'model_type': cfg.get('model_type', 'baseline'),
         'run_name': run_name,
         'tokens_seen': tokens_seen,
         'train_losses': train_losses,
@@ -234,6 +276,15 @@ def main():
         'test_ppl': ppl,
         'gradient_checkpointing': use_ckpt,
     }
+    
+    # Add MoE-specific metrics
+    if is_moe:
+        metrics.update({
+            'num_experts': model_cfg['num_experts'],
+            'top_k': model_cfg['top_k'],
+            'capacity_factor': model_cfg['capacity_factor'],
+            'aux_loss_weight': aux_weight,
+        })
     with open(metrics_path, 'w', encoding='utf-8') as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
     logger.info(f"Métricas salvas em: {metrics_path}")
@@ -264,7 +315,7 @@ def main():
         enc = tiktoken.get_encoding('gpt2')
         gens = {}
         for i, p in enumerate(prompts, 1):
-            text = generate_text(model, enc, p, max_new_tokens=120, context_size=cfg['training']['context_length'], use_ckpt=use_ckpt)
+            text = generate_text(model, enc, p, max_new_tokens=120, context_size=cfg['training']['context_length'], is_moe=is_moe, use_ckpt=use_ckpt)
             gens[f'prompt_{i}'] = {'prompt': p, 'text': text}
         gen_path = os.path.join(save_dir, 'generations', f'{run_name}_generations.json')
         with open(gen_path, 'w', encoding='utf-8') as f:
