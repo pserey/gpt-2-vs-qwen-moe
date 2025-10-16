@@ -302,13 +302,13 @@ def main():
         plt.savefig(fig_path); plt.close()
         logger.info(f"Curva de convergência salva em: {fig_path}")
 
-    # Qualitative generation
+    # Qualitative generation - Portuguese Gutenberg style prompts
     prompts = [
-        "Era uma vez, em um vilarejo do interior,",
-        "No contexto da ciência de dados, é importante lembrar que",
-        "Em 2025, o Brasil enfrentou desafios e",
-        "No sertão do Ceará, o vento soprava e",
-        "Segundo especialistas, a economia brasileira deve"
+        "O velho solar dormia entre montes, guardando um segredo que poucos ousavam recordar.",
+        "Diziam os sábios que a razão humana era apenas um eco da memória divina.",
+        "Nos tempos do Império, muitos temiam que a liberdade fosse mero nome de poder.",
+        "No sertão do Ceará, o vento trazia poeira, lembranças e o canto dos vaqueiros.",
+        "Segundo os economistas do reino, a prosperidade nascia mais da virtude que do ouro."
     ]
     try:
         import tiktoken
